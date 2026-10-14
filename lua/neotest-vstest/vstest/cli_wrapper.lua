@@ -5,21 +5,21 @@ local dotnet_utils = require("neotest-vstest.dotnet_utils")
 
 local M = {}
 
-function M.get_vstest_path()
+---@async
+---@return string?
+local function find_vstest_path()
   local config = require("neotest-vstest.config").get_config()
   local path_to_search = config.sdk_path
 
   if not path_to_search then
-    local process = vim.system({ "dotnet", "--info" })
-
     local default_sdk_path
-    if vim.fn.has("win32") then
+    if vim.fn.has("win32") == 1 then
       default_sdk_path = "C:/Program Files/dotnet/sdk/"
     else
       default_sdk_path = "/usr/local/share/dotnet/sdk/"
     end
 
-    local obj = process:wait()
+    local _, obj = dotnet_utils.run_dotnet({ "--info" }, { no_build_args = true })
 
     local out = obj.stdout
     local info = dotnet_utils.parse_dotnet_info(out or "")
@@ -38,7 +38,33 @@ function M.get_vstest_path()
     end
   end
 
-  return vim.fs.find("vstest.console.dll", { upward = false, type = "file", path = path_to_search })[1]
+  if not lib.files.is_dir(path_to_search) then
+    logger.warn("neotest-vstest: sdk path does not exist: " .. path_to_search)
+    return nil
+  end
+
+  return vim.iter(lib.files.find(vim.fs.normalize(path_to_search))):find(function(file)
+    return vim.fs.basename(file) == "vstest.console.dll"
+  end)
+end
+
+---@type nio.control.Future?
+local vstest_path
+
+---@async
+---@return string?
+function M.get_vstest_path()
+  -- every project's client asks for this at once, so they share one search
+  if not vstest_path then
+    vstest_path = nio.control.future()
+    local ok, path = pcall(find_vstest_path)
+    if ok then
+      vstest_path.set(path)
+    else
+      vstest_path.set_error(path)
+    end
+  end
+  return vstest_path.wait()
 end
 
 local function get_script(script_name)
@@ -62,7 +88,9 @@ function M.create_test_runner(project)
   logger.debug("neotest-vstest: found discovery script: " .. test_discovery_script)
   logger.debug("neotest-vstest: found testhost dll: " .. testhost_dll)
 
-  local vstest_command = { "dotnet", "fsi", test_discovery_script, testhost_dll }
+  local vstest_command =
+    { dotnet_utils.get_dotnet_executable(), "fsi", test_discovery_script, testhost_dll }
+  nio.scheduler()
 
   logger.info("neotest-vstest: starting vstest console with for " .. project.dll_file .. " with:")
   logger.info(vstest_command)

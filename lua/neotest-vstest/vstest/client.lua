@@ -8,14 +8,9 @@ local M = {}
 ---@param project_dir string
 ---@return string? path to .runsettings file to use or nil
 function M.find_runsettings_for_project(project_dir)
-  local settings = vim.fs.find(function(name, _)
-    return name:match("%.runsettings$")
-  end, {
-    upward = false,
-    type = "file",
-    path = project_dir,
-    limit = math.huge,
-  })
+  local settings = vim.tbl_filter(function(file)
+    return vim.fs.basename(file):match("%.runsettings$") ~= nil
+  end, lib.files.find(project_dir))
 
   for _, set in pairs(settings) do
     logger.debug(string.format("neotest-vstest: Found .runsettings: %s", set))

@@ -44,26 +44,19 @@ local function create_adapter()
 
     local solutions = {}
 
+    local function find_solutions(search_root)
+      return vim.tbl_filter(function(file)
+        return vim.fs.basename(file):match("%.slnx?$") ~= nil
+          and not ignore_function(vim.fs.dirname(file))
+      end, lib.files.find(search_root))
+    end
+
     if first_solution then
-      solutions = vim.fs.find(function(name, search_path)
-        return name:match("%.slnx?$") and not ignore_function(search_path)
-      end, {
-        upward = false,
-        type = "file",
-        path = first_solution,
-        limit = math.huge,
-      })
+      solutions = find_solutions(first_solution)
       logger.info(string.format("neotest-vstest: scanning %s for solution file...", first_solution))
       logger.info(solutions)
     elseif config.broad_recursive_discovery then
-      solutions = vim.fs.find(function(name, search_path)
-        return name:match("%.slnx?$") and not ignore_function(search_path)
-      end, {
-        upward = false,
-        type = "file",
-        path = path,
-        limit = math.huge,
-      })
+      solutions = find_solutions(path)
       logger.info(string.format("neotest-vstest: scanning %s for solution file...", path))
       logger.info(solutions)
     end
@@ -105,10 +98,40 @@ local function create_adapter()
 
       if solution_future.wait() and solution then
         dotnet_utils.build_path(solution)
-        dotnet_utils.get_solution_info(solution)
+        local solution_info = dotnet_utils.get_solution_info(solution)
         solution = string.gsub(solution, "/", lib.files.sep)
         solution_dir = string.gsub(vim.fs.dirname(solution), "/", lib.files.sep)
         logger.info(string.format("neotest-vstest: found solution dir %s", solution_dir))
+
+        local background_discovery_semaphore = require("nio").control.semaphore(
+          math.max(1, math.floor(vim.uv.available_parallelism() / 2))
+        )
+
+        -- neotest checks files one at a time, so without this each project's test host
+        -- only starts once the previous project has finished discovering
+        local client_discovery = require("neotest-vstest.client")
+        local projects = solution_info and solution_info.projects or {}
+        local solution_file = solution
+        for _, project in ipairs(projects) do
+          nio.run(function()
+            -- each client is a test host process, so only a few are started at a time
+            background_discovery_semaphore.with(function()
+              local client = client_discovery.get_client_for_project(project, solution_file)
+              if client then
+                client:discover_tests()
+              end
+            end)
+          end, function(success, err)
+            if not success then
+              logger.warn(
+                "neotest-vstest: background discovery failed for "
+                  .. project.proj_file
+                  .. ": "
+                  .. tostring(err)
+              )
+            end
+          end)
+        end
         return solution_dir
       end
     end
@@ -122,6 +145,8 @@ local function create_adapter()
     root_semaphore.with(function()
       root = find_root(path)
     end)
+    -- discovery ends on libuv callbacks; adapters checked after this one need the main loop
+    require("nio").scheduler()
     return root
   end
 
@@ -434,7 +459,14 @@ local function create_adapter()
       local lang_tree =
         vim.treesitter.get_string_parser(content, filetype, { injections = { [filetype] = "" } })
 
-      local root = lang_tree:parse(false)[1]:root()
+      -- parse in time-sliced steps so large test files don't freeze neovim,
+      -- falling back to a blocking parse if it takes longer than 'redrawtime'
+      local parsed = nio.control.future()
+      lang_tree:parse(false, function(err, trees)
+        parsed.set(not err and trees or nil)
+      end)
+      local trees = parsed.wait() or lang_tree:parse(false)
+      local root = trees[1]:root()
 
       ---@type vim.treesitter.Query
       local query = lib.treesitter.normalise_query(

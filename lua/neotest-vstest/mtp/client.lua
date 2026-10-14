@@ -1,6 +1,7 @@
 local nio = require("nio")
 local logger = require("neotest.logging")
 local types = require("neotest.types")
+local dotnet_utils = require("neotest-vstest.dotnet_utils")
 
 local M = {}
 
@@ -10,6 +11,7 @@ local M = {}
 ---@param mtp_env? table<string, string> environment variables for the mtp server
 ---@return nio.control.Future<uv.uv_tcp_t> server_future, vim.SystemObj mtp_process
 local function start_server(dll_path, mtp_env)
+  local dotnet = dotnet_utils.get_dotnet_executable()
   local server, server_err = vim.uv.new_tcp()
   assert(server, server_err)
 
@@ -59,7 +61,7 @@ local function start_server(dll_path, mtp_env)
   logger.debug("neotest-vstest: proxy server started on port: " .. server:getsockname().port)
 
   local process = vim.system({
-    "dotnet",
+    dotnet,
     dll_path,
     "--server",
     "--client-port",
